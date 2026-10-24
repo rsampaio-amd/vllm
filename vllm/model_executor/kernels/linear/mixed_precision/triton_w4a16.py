@@ -20,6 +20,8 @@ Checkpoint layout from compressed_tensors_wNa16 create_weights:
 
 import torch
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
 from vllm.platforms import current_platform
@@ -28,6 +30,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
+
+logger = init_logger(__name__)
 
 TRITON_W4A16_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128, 256]
 TRITON_W4A16_SUPPORTED_QUANT_TYPES = [
@@ -456,9 +460,55 @@ class TritonW4A16LinearKernel(MPLinearKernel):
                     torch.nn.Parameter(zp_data, requires_grad=False),
                 )
 
+        if envs.VLLM_ROCM_W4A16_DEQUANT_BF16:
+            self._materialize_w4a16_bf16(layer)
+
+    def _materialize_w4a16_bf16(self, layer: torch.nn.Module) -> None:
+        """Unpack grouped int4 once and run a bf16 GEMM.
+
+        On gfx950 the Triton W4A16 kernel is several times slower than
+        hipBLASLt at decode widths. Set VLLM_ROCM_W4A16_DEQUANT_BF16=1 to
+        materialize bf16 weights at load. This spends the int4 memory
+        saving; it is a decode-throughput path, not a memory path.
+        """
+        c = self.config
+        w_q, w_s, w_zp = self._get_weight_params(layer)
+        w = w_q.data
+        scales = w_s.data
+        k = w.shape[0]
+        n = w.shape[1] * 8
+        group = c.group_size if c.group_size != -1 else k
+        shifts = torch.arange(8, device=w.device, dtype=torch.int32) * 4
+        unpacked = ((w.unsqueeze(-1) >> shifts) & 0xF).reshape(k, n).to(torch.int16)
+        if c.weight_type.has_bias():
+            q = unpacked - int(c.weight_type.bias)
+        else:
+            z = w_zp.data
+            z_unpacked = ((z.unsqueeze(-1) >> shifts) & 0xF).reshape(z.shape[0], n)
+            q = unpacked - z_unpacked.repeat_interleave(group, dim=0).to(torch.int16)
+        scale_full = scales.repeat_interleave(group, dim=0)
+        bf = (q.to(torch.bfloat16) * scale_full.to(torch.bfloat16)).t().contiguous()
+        layer.register_parameter(
+            "_w4a16_bf16", torch.nn.Parameter(bf, requires_grad=False)
+        )
+        w_q.data = torch.empty(0, dtype=w.dtype, device=w.device)
+        w_s.data = torch.empty(0, dtype=scales.dtype, device=scales.device)
+        if w_zp is not None and getattr(w_zp, "data", None) is not None:
+            w_zp.data = torch.empty(0, dtype=w_zp.data.dtype, device=w.device)
+        logger.info(
+            "W4A16 %s unpacked to bf16 %s (VLLM_ROCM_W4A16_DEQUANT_BF16=1)",
+            getattr(layer, "prefix", layer.__class__.__name__),
+            tuple(bf.shape),
+        )
+
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        w_bf = getattr(layer, "_w4a16_bf16", None)
+        if w_bf is not None:
+            x_2d = x.reshape(-1, x.shape[-1])
+            out = torch.nn.functional.linear(x_2d, w_bf, bias)
+            return out.reshape(x.shape[:-1] + (w_bf.shape[0],))
         c = self.config
         w_q, w_s, w_zp = self._get_weight_params(layer)
 
